@@ -13,13 +13,15 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 import argparse
 import asyncio
 import os.path
 import json
 import re
+import traceback
 
+import socks
 from telethon import TelegramClient
 from telethon.tl.functions.messages import GetAllStickersRequest, GetStickerSetRequest
 from telethon.tl.types.messages import AllStickers
@@ -38,6 +40,44 @@ async def reupload_document(client: TelegramClient, document: Document) -> Tuple
     mxc = await matrix.upload(data, "image/png", f"{document.id}.png")
     print(".", flush=True)
     return util.make_sticker(mxc, width, height, len(data)), data
+
+
+def _format_document_attributes(document: Document) -> str:
+    parts = []
+    for attr in document.attributes:
+        values = []
+        for key, value in vars(attr).items():
+            if key.startswith("_") or value in (None, [], {}, ""):
+                continue
+            values.append(f"{key}={value!r}")
+        if values:
+            parts.append(f"{type(attr).__name__}({', '.join(values)})")
+        else:
+            parts.append(type(attr).__name__)
+    return ", ".join(parts) or "None"
+
+
+def handle_reupload_error(document: Document, err: Exception) -> bool:
+    print()
+    print(f"Error: Failed to process sticker {document.id}")
+    print(f"Error: Type: {type(err).__name__}")
+    print(f"Error: Message: {err}")
+    print(f"Error: Mime type: {getattr(document, 'mime_type', None)}")
+    print(f"Error: Size: {getattr(document, 'size', None)}")
+    print(f"Error: Attributes: {_format_document_attributes(document)}")
+    print("Error: Traceback:")
+    for line in traceback.format_exc().rstrip().splitlines():
+        print(f"  {line}")
+
+    while True:
+        answer = input("Continue and skip this sticker? [y/N]: ").strip().lower()
+        if answer in ("y", "yes"):
+            print(f"Skipped {document.id} After error")
+            return True
+        if answer in ("", "n", "no"):
+            print(f"Stopping After error on {document.id}")
+            return False
+        print("Error: Invalid choice, enter 'y' or 'n'")
 
 
 def add_meta(document: Document, info: matrix.StickerInfo, pack: StickerSetFull) -> None:
@@ -78,19 +118,29 @@ async def reupload_pack(client: TelegramClient, pack: StickerSetFull, output_dir
     stickers_data: Dict[str, bytes] = {}
     reuploaded_documents: Dict[int, matrix.StickerInfo] = {}
     for document in pack.documents:
+        data: Optional[bytes] = None
         try:
             reuploaded_documents[document.id] = already_uploaded[document.id]
             print(f"Skipped reuploading {document.id}")
         except KeyError:
-            reuploaded_documents[document.id], data = await reupload_document(client, document)
+            try:
+                reuploaded_documents[document.id], data = await reupload_document(client, document)
+            except Exception as err:
+                if handle_reupload_error(document, err):
+                    continue
+                raise
         # Always ensure the body and telegram metadata is correct
         add_meta(document, reuploaded_documents[document.id], pack)
-        stickers_data[reuploaded_documents[document.id]["url"]] = data
+        if data is not None:
+            stickers_data[reuploaded_documents[document.id]["url"]] = data
 
     for sticker in pack.packs:
         if not sticker.emoticon:
             continue
         for document_id in sticker.documents:
+            if document_id not in reuploaded_documents:
+                print(f"Warning: Missing sticker {document_id} In reuploaded documents, skipping emoticon")
+                continue
             doc = reuploaded_documents[document_id]
             # If there was no sticker metadata, use the first emoji we find
             if doc["body"] == "":
@@ -117,6 +167,19 @@ pack_url_regex = re.compile(r"^(?:(?:https?://)?(?:t|telegram)\.(?:me|dog)/addst
                             r"([A-Za-z0-9-_]+)"
                             r"(?:\.json)?$")
 
+
+def parse_proxy(proxy: str) -> Tuple[int, str, int, bool]:
+    try:
+        address, port = proxy.rsplit(":", 1)
+    except ValueError as err:
+        raise ValueError("Proxy must be in address:port format") from err
+    if not address:
+        raise ValueError("Proxy address cannot be empty")
+    try:
+        return socks.SOCKS5, address, int(port), True
+    except ValueError as err:
+        raise ValueError("Proxy port must be a number") from err
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--list", help="List your saved sticker packs", action="store_true")
@@ -124,6 +187,7 @@ parser.add_argument("--session", help="Telethon session file name", default="sti
 parser.add_argument("--config",
                     help="Path to JSON file with Matrix homeserver and access_token",
                     type=str, default="config.json")
+parser.add_argument("--proxy", help="SOCKS5H proxy in address:port format", type=str)
 parser.add_argument("--output-dir", help="Directory to write packs to", default="web/packs/",
                     type=str)
 parser.add_argument("pack", help="Sticker pack URLs to import", action="append", nargs="*")
@@ -131,7 +195,8 @@ parser.add_argument("pack", help="Sticker pack URLs to import", action="append",
 
 async def main(args: argparse.Namespace) -> None:
     await matrix.load_config(args.config)
-    client = TelegramClient(args.session, 298751, "cb676d6bae20553c9996996a8f52b4d7")
+    proxy = parse_proxy(args.proxy) if args.proxy else None
+    client = TelegramClient(args.session, 298751, "cb676d6bae20553c9996996a8f52b4d7", proxy=proxy)
     await client.start()
 
     if args.list:
@@ -148,7 +213,7 @@ async def main(args: argparse.Namespace) -> None:
         for pack_url in args.pack[0]:
             match = pack_url_regex.match(pack_url)
             if not match:
-                print(f"'{pack_url}' doesn't look like a sticker pack URL")
+                print(f"'{pack_url}' Doesn't look like a sticker pack URL")
                 return
             input_packs.append(InputStickerSetShortName(short_name=match.group(1)))
         for input_pack in input_packs:
